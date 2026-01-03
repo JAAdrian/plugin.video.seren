@@ -45,6 +45,15 @@ def alldebrid_guard_response(func):
 
 
 class AllDebrid:
+    """AllDebrid API wrapper.
+
+    Documentation for deprecated v4.0 `magnet/status`:
+    https://docs.alldebrid.com/#v4-magnet-status
+
+    Documentation for v4.1 `magnet/status`:
+    https://docs.alldebrid.com/#get-status
+    """
+
     base_url = "https://api.alldebrid.com/v4.1/"
 
     http_codes = {

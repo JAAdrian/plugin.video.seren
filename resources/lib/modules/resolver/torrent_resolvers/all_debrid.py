@@ -6,8 +6,22 @@ from resources.lib.modules.resolver.torrent_resolvers.base_resolver import (
 )
 
 
-def _translate_to_old_objects(objects: list[dict]) -> list:
-    """This function mocks the AllDebrid v4.0 API version return objects."""
+def _translate_to_v4_objects(objects: list[dict]) -> list[dict]:
+    """This function mocks the AllDebrid v4.0 API version return objects.
+
+    A single dict in the output list will look like:
+    {
+        "link": <url>,
+        "filename": <filename>,
+        "size": <file_size>,
+        "files": [
+            {"n": <filename>}
+        ]
+    }
+
+    This way, the consuming cleaner/utility functions in the resolver will be able to
+    filter for video-based files and the whole pipeline should work.
+    """
     all_files = list()
     for file in objects:
         folder_files = file["e"]
@@ -53,7 +67,7 @@ class AllDebridResolver(TorrentResolverBase):
         # The key in "status" is now called "files" instead of "links" and has a
         # different nesting structure.
         files = status["files"]
-        all_files = _translate_to_old_objects(files)
+        all_files = _translate_to_v4_objects(files)
 
         return all_files
 
