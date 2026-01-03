@@ -6,6 +6,27 @@ from resources.lib.modules.resolver.torrent_resolvers.base_resolver import (
 )
 
 
+def _translate_to_old_objects(objects: list[dict]) -> list:
+    """This function mocks the AllDebrid v4.0 API version return objects."""
+    all_files = list()
+    for file in objects:
+        folder_files = file["e"]
+        for ffile in folder_files:
+            name = ffile["n"]
+            size = ffile["s"]
+            link = ffile["l"]
+
+            new_file = {
+                "link": link,
+                "filename": name,
+                "size": size,
+                "files": [{"n": name}]
+            }
+
+            all_files.append(new_file)
+    return all_files
+
+
 class AllDebridResolver(TorrentResolverBase):
     """
     Resolver for All Debrid
@@ -28,7 +49,13 @@ class AllDebridResolver(TorrentResolverBase):
         if status["status"] != "Ready":
             self.debrid_module.delete_magnet(self.magnet_id)
             raise GeneralCachingFailure(status)
-        return status['links']
+
+        # The key in "status" is now called "files" instead of "links" and has a
+        # different nesting structure.
+        files = status["files"]
+        all_files = _translate_to_old_objects(files)
+
+        return all_files
 
     def resolve_stream_url(self, file_info):
         """

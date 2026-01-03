@@ -45,7 +45,7 @@ def alldebrid_guard_response(func):
 
 
 class AllDebrid:
-    base_url = "https://api.alldebrid.com/v4/"
+    base_url = "https://api.alldebrid.com/v4.1/"
 
     http_codes = {
         200: "Success",
