@@ -25,6 +25,7 @@ from resources.lib.database.torrentCache import TorrentCache
 from resources.lib.debrid import all_debrid
 from resources.lib.debrid import premiumize
 from resources.lib.debrid import real_debrid
+from resources.lib.debrid import torbox
 from resources.lib.gui.windows.get_sources_window import GetSourcesWindow
 from resources.lib.gui.windows.manual_caching import ManualCacheWindow
 from resources.lib.modules import monkey_requests
@@ -32,6 +33,9 @@ from resources.lib.modules import resolver as resolver
 from resources.lib.modules.cloud_scrapers import AllDebridCloudScraper
 from resources.lib.modules.cloud_scrapers import PremiumizeCloudScraper
 from resources.lib.modules.cloud_scrapers import RealDebridCloudScraper
+from resources.lib.modules.cloud_scrapers import TorBoxCloudScraper
+from resources.lib.modules.local_scraper import LocalFileScraper
+from resources.lib.modules.local_scraper import local_scraping_enabled
 from resources.lib.modules.globals import g
 from resources.lib.modules.source_sorter import SourceSorter
 
@@ -104,6 +108,7 @@ class Sources:
         self.source_sorter = SourceSorter(self.item_information)
 
         self.preem_enabled = g.get_bool_setting('preem.enabled')
+        self.preem_waitfor_directfiles = g.get_bool_setting("preem.waitfor.directfiles")
         self.preem_waitfor_cloudfiles = g.get_bool_setting("preem.waitfor.cloudfiles")
         self.preem_cloudfiles = g.get_bool_setting('preem.cloudfiles')
         self.preem_adaptive_sources = g.get_bool_setting('preem.adaptiveSources')
@@ -113,6 +118,7 @@ class Sources:
         self.preem_resolutions = approved_qualities[
             g.get_int_setting("general.maxResolution") : self._get_pre_term_min()
         ]
+        self.local_scraping_enabled = local_scraping_enabled()
 
     def get_sources(self, overwrite_torrent_cache=False):
         """
@@ -156,6 +162,8 @@ class Sources:
 
             # Add the users cloud inspection to the threads to be run
             self.torrent_threads.put(self._user_cloud_inspection)
+            if self.local_scraping_enabled:
+                self.torrent_threads.put(self._user_local_inspection)
 
             # Load threads for all sources
             self._create_torrent_threads()
@@ -171,12 +179,14 @@ class Sources:
                 + len(self.direct_providers)
                 + len(self.cloud_scrapers)
                 <= 0
+                and not self.local_scraping_enabled
             ):
                 self.runtime = time.time() - start_time
                 if self.runtime > 5:
                     g.notification(g.ADDON_NAME, g.get_language_string(30615))
                     g.log('No providers enabled', 'warning')
-                    return
+                    g.cancel_playback()
+                    return [], [], self.item_information
 
             self.window.set_property("has_torrent_providers", "true" if len(self.torrent_providers) > 0 else "false")
             self.window.set_property("has_hoster_providers", "true" if len(self.hoster_providers) > 0 else "false")
@@ -184,7 +194,7 @@ class Sources:
             self.window.set_property("has_cloud_scrapers", "true" if len(self.cloud_scrapers) > 0 else "false")
             self.window.set_property(
                 "has_direct_providers",
-                "true" if len(self.direct_providers) > 0 else "false",
+                "true" if len(self.direct_providers) > 0 or self.local_scraping_enabled else "false",
             )
             self._update_progress()
             self.window.set_property('process_started', 'true')
@@ -206,6 +216,7 @@ class Sources:
                             + len(self.adaptive_providers)
                             + len(self.direct_providers)
                             + (1 if self.cloud_scrapers else 0)
+                            + (1 if self.local_scraping_enabled else 0)
                         )
                         * 100
                     )
@@ -381,6 +392,7 @@ class Sources:
             (g.get_bool_setting('premiumize.torrents') and g.premiumize_enabled())
             or (g.get_bool_setting('rd.torrents') and g.real_debrid_enabled())
             or (g.get_bool_setting('alldebrid.torrents') and g.all_debrid_enabled())
+            or (g.get_bool_setting('tb.torrents') and g.torbox_enabled())
         )
 
     @staticmethod
@@ -389,6 +401,7 @@ class Sources:
             (g.get_bool_setting('premiumize.hosters') and g.premiumize_enabled())
             or (g.get_bool_setting('rd.hosters') and g.real_debrid_enabled())
             or (g.get_bool_setting('alldebrid.hosters') and g.all_debrid_enabled())
+            or (g.get_bool_setting('tb.hosters') and g.torbox_enabled())
         )
 
     def _store_torrent_results(self, torrent_list):
@@ -604,7 +617,9 @@ class Sources:
         source["quality"] = source.get("quality", source_utils.get_quality(source["release_title"]))
         source["size"] = self._torrent_filesize(source, info)
         source["info"] = set(source.get("info", source_utils.get_info(source["release_title"])))
-        source["seeds"] = source.get("seeds", self._torrent_seeds(source))
+        # Always coerce: a provider may supply seeds as a string (or junk), which would
+        # otherwise crash the int/str mixed sort in _get_best_torrent_to_cache.
+        source["seeds"] = self._torrent_seeds(source)
         source["provider_imports"] = provider_module
         source["provider"] = source.get("provider_name_override", provider_name.upper())
         source["hash"] = source.get("hash", self.hash_regex.findall(source["magnet"])[0]).lower()
@@ -759,6 +774,11 @@ class Sources:
                     "provider": AllDebridCloudScraper,
                     "enabled": g.all_debrid_enabled(),
                 },
+                {
+                    "setting": "tb.cloudInspection",
+                    "provider": TorBoxCloudScraper,
+                    "enabled": g.torbox_enabled(),
+                },
             ]
 
             for cloud_scraper in cloud_scrapers:
@@ -773,6 +793,24 @@ class Sources:
 
         finally:
             self.sources_information['statistics']['remainingProviders'].remove("Cloud Inspection")
+
+    def _user_local_inspection(self):
+        self.sources_information['statistics']['remainingProviders'].append("Local Inspection")
+        try:
+            if not self.local_scraping_enabled:
+                return
+
+            if self.media_type == g.MEDIA_EPISODE:
+                simple_info = self._build_simple_show_info(self.item_information)
+            else:
+                simple_info = self._build_simple_movie_info(self.item_information)
+
+            sources = LocalFileScraper(self._prem_terminate).get_sources(self.item_information, simple_info)
+            if sources:
+                self.sources_information['directSources'].extend(sources)
+        finally:
+            with contextlib.suppress(ValueError):
+                self.sources_information['statistics']['remainingProviders'].remove("Local Inspection")
 
     @staticmethod
     def _color_number(number):
@@ -878,15 +916,50 @@ class Sources:
         )
 
     @staticmethod
+    def _torrent_clean_alias(title):
+        """Query-friendly variant of a title with characters that commonly break
+        torrent/usenet search removed (colons, apostrophes, ampersands, brackets).
+        Returns '' when the result is empty or unchanged-worthy."""
+        if not title:
+            return ""
+        cleaned = re.sub(r"[:'&()\[\]]", " ", title)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _append_clean_alias(title, aliases):
+        """Append a torrent-clean alias to the alias list if it adds anything new."""
+        clean_alias = Sources._torrent_clean_alias(title)
+        if clean_alias and clean_alias.lower() != (title or "").lower() and clean_alias not in aliases:
+            aliases.append(clean_alias)
+
+    @staticmethod
+    def _append_language_aliases(info_dict, aliases):
+        """For anime, queue both the English and Romaji titles as aliases so the
+        anime scrapers (nyaa/anirena/animetosho) match releases regardless of which
+        naming convention they use. These fields only exist for anime, so this is a
+        no-op for everything else."""
+        for key in ("title_en", "title_romaji"):
+            alt = (info_dict.get(key) or "").strip()
+            if alt and alt not in aliases:
+                aliases.append(alt)
+                Sources._append_clean_alias(alt, aliases)
+
+    @staticmethod
     def _build_simple_show_info(info):
+        from resources.lib.simkl.ids import episode_num_from_info
+
+        ep_info = info.get("info") or {}
+        season_num = ep_info.get("season")
+        episode_num = episode_num_from_info(ep_info)
         simple_info = {
-            'show_title': info['info'].get('tvshowtitle', ''),
-            'episode_title': info['info'].get('originaltitle', ''),
-            'year': str(info['info'].get('tvshow.year', info['info'].get('year', ''))),
-            'season_number': str(info['info']['season']),
-            'episode_number': str(info['info']['episode']),
-            'show_aliases': info['info'].get('aliases', []),
-            'country': info['info'].get('country_origin', ''),
+            'show_title': ep_info.get('tvshowtitle', ''),
+            'episode_title': ep_info.get('originaltitle', ''),
+            'year': str(ep_info.get('tvshow.year', ep_info.get('year', ''))),
+            'season_number': str(season_num if season_num is not None else ''),
+            'episode_number': str(episode_num if episode_num is not None else ''),
+            'show_aliases': ep_info.get('aliases', []),
+            'country': ep_info.get('country_origin', ''),
             'no_seasons': str(info.get('season_count', '')),
             'absolute_number': str(info.get('absoluteNumber', '')),
             'is_airing': info.get('is_airing', False),
@@ -896,7 +969,9 @@ class Sources:
 
         if '.' in simple_info['show_title']:
             simple_info['show_aliases'].append(source_utils.clean_title(simple_info['show_title'].replace('.', '')))
-        if any(x in i.lower() for i in info['info'].get('genre', ['']) for x in ['anime', 'animation']):
+        Sources._append_clean_alias(simple_info['show_title'], simple_info['show_aliases'])
+        Sources._append_language_aliases(ep_info, simple_info['show_aliases'])
+        if any(x in i.lower() for i in ep_info.get('genre', ['']) for x in ['anime', 'animation']):
             simple_info['isanime'] = True
 
         return simple_info
@@ -912,6 +987,8 @@ class Sources:
 
         if '.' in simple_info['title']:
             simple_info['aliases'].append(source_utils.clean_title(simple_info['title'].replace('.', '')))
+        Sources._append_clean_alias(simple_info['title'], simple_info['aliases'])
+        Sources._append_language_aliases(info['info'], simple_info['aliases'])
 
         return simple_info
 
@@ -980,12 +1057,24 @@ class Sources:
     def _get_filtered_count_by_resolutions(self, resolutions, quality_count_dict):
         return sum(quality_count_dict[resolution] for resolution in resolutions)
 
+    def _direct_inspection_running(self):
+        remaining = self.sources_information['statistics']['remainingProviders']
+        if "Local Inspection" in remaining:
+            return True
+        for provider in self.direct_providers:
+            if provider[1].upper() in remaining:
+                return True
+        return False
+
     def _prem_terminate(self):  # pylint: disable=method-hidden
         if self.canceled:
             monkey_requests.PRE_TERM_BLOCK = True
             return True
 
         if not self.preem_enabled:
+            return False
+
+        if self.preem_waitfor_directfiles and self._direct_inspection_running():
             return False
 
         if (
@@ -1140,24 +1229,63 @@ class TorrentCacheCheck:
 
         if g.all_debrid_enabled() and g.get_bool_setting('alldebrid.torrents'):
             self.threads.put(self._all_debrid_worker, copy.deepcopy(torrent_list))
+
+        if g.torbox_enabled() and g.get_bool_setting('tb.torrents'):
+            self.threads.put(self._torbox_worker, copy.deepcopy(torrent_list))
         self.threads.wait_completion()
 
     def _all_debrid_worker(self, torrent_list):
         try:
             if len(torrent_list) == 0:
                 return
-            
+
+            all_debrid_api = all_debrid.AllDebrid()
+
+            # Collect unique hashes (a source list may contain duplicates).
+            seen_hashes = set()
+            unique_items = []
             for i in torrent_list:
+                hash_value = i.get("hash", "").lower().strip()
+                if not hash_value or hash_value in seen_hashes:
+                    continue
+                seen_hashes.add(hash_value)
+                unique_items.append((hash_value, i))
+
+            if not unique_items:
+                return
+
+            # Sequential check_hash — each call has its own request timeout,
+            # so worst-case latency is bounded. With ~10 hashes and 1s per
+            # cached hit, this is ~10s instead of the previous 130s.
+            for hash_value, item in unique_items:
                 try:
-                    i['debrid_provider'] = 'all_debrid'
-                    self.store_torrent(i)
-                except KeyError:
+                    check = all_debrid_api.check_hash(hash_value)
+                except Exception as e:
                     g.log(
-                        "KeyError in AllDebrid Cache check worker. "
-                        "Failed to walk AllDebrid cache check response, check your auth and account status",
-                        "error",
+                        f"AllDebrid: check_hash raised {type(e).__name__}: {e}",
+                        "warning",
                     )
-                    return
+                    continue
+
+                if hash_value not in check:
+                    g.log(
+                        f"AllDebrid: hash {hash_value[:8]}... not servable, "
+                        f"skipping source '{item.get('release_title', '')[:60]}'",
+                        "info",
+                    )
+                    continue
+
+                # Mark every torrent entry with this hash as servable.
+                for j in torrent_list:
+                    if j.get("hash", "").lower().strip() == hash_value:
+                        j['debrid_provider'] = 'all_debrid'
+                        self.store_torrent(j)
+        except KeyError:
+            g.log(
+                "KeyError in AllDebrid Cache check worker. "
+                "Failed to walk AllDebrid cache check response, check your auth and account status",
+                "error",
+            )
         except Exception:
             g.log_stacktrace()
 
@@ -1202,6 +1330,21 @@ class TorrentCacheCheck:
         except Exception:
             g.log_stacktrace()
 
+    def _torbox_worker(self, torrent_list):
+        try:
+            hash_list = [i['hash'] for i in torrent_list]
+            if not hash_list:
+                return
+            cached_hashes = torbox.TorBox().check_hash(hash_list)
+            if not cached_hashes:
+                return
+            for i in torrent_list:
+                if i['hash'].lower() in [h.lower() for h in cached_hashes]:
+                    i['debrid_provider'] = 'torbox'
+                    self.store_torrent(i)
+        except Exception:
+            g.log_stacktrace()
+
 
 class SourceWindowAdapter:
     """
@@ -1209,7 +1352,7 @@ class SourceWindowAdapter:
     """
 
     def __init__(self, item_information, scraper_sclass):
-        self.trakt_id = 0
+        self.simkl_id = 0
         self.silent = g.get_bool_runtime_setting('tempSilent')
 
         try:
@@ -1232,7 +1375,7 @@ class SourceWindowAdapter:
         if self.display_style == 1:
             # this one is deleted in `close()`
             self.background_dialog = xbmcgui.DialogProgressBG()
-            self.trakt_id = self.item_information['trakt_id']
+            self.simkl_id = self.item_information['simkl_id']
             if self.media_type == 'episode':
                 self.background_dialog.create(
                     f"{self.item_information['info']['tvshowtitle']} - "
